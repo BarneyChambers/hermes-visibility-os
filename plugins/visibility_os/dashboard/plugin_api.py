@@ -71,6 +71,10 @@ def _is_github_actions_run_url(url: str | None) -> bool:
     return bool(url and "/actions/runs/" in url)
 
 
+def _is_github_issue_url(url: str | None) -> bool:
+    return bool(url and "/issues/" in url)
+
+
 def _feed_action(action: dict[str, Any]) -> dict[str, Any]:
     item = {"kind": "action", **action}
     opportunity_id = action.get("opportunity_id")
@@ -84,6 +88,7 @@ def _feed_action(action: dict[str, Any]) -> dict[str, Any]:
     item["opportunity_source_url"] = source_url
     item["opportunity_title"] = opportunity.get("title")
     item["can_diagnose_ci"] = _is_github_actions_run_url(source_url)
+    item["can_fix_issue"] = _is_github_issue_url(source_url)
     return item
 
 
@@ -114,7 +119,8 @@ async def feed() -> dict[str, Any]:
     for a in actions:
         items.append(_feed_action(a))
     for o in opportunities:
-        items.append({"kind": "opportunity", "can_diagnose_ci": _is_github_actions_run_url(o.get("source_url")), **o})
+        source_url = o.get("source_url")
+        items.append({"kind": "opportunity", "can_diagnose_ci": _is_github_actions_run_url(source_url), "can_fix_issue": _is_github_issue_url(source_url), **o})
     items.sort(key=lambda x: (x.get("created_at") or x.get("updated_at") or ""), reverse=True)
     return {"items": items, "counts": {"actions": len(actions), "opportunities": len(opportunities)}}
 
@@ -202,6 +208,18 @@ async def fix_ci_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/opportunities/{opportunity_id}/fix-issue")
+async def fix_issue_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
+    try:
+        action = draft_action_from_opportunity(opportunity_id, action_kind="github_issue_fix_lane", actor=body.actor)
+        approve_action(action["id"], actor=body.actor)
+        return execute_approved_action(action["id"], actor=body.actor)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @router.post("/opportunities/{opportunity_id}/audit-pr")
 async def audit_pr_opportunity(opportunity_id: str, body: OpportunityAuditBody) -> dict[str, Any]:

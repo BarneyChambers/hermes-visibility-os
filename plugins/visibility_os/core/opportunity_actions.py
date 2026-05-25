@@ -30,6 +30,13 @@ def _github_actions_ref(source_url: str | None) -> tuple[str, str] | None:
     return match.group(1), match.group(2)
 
 
+def _github_issue_ref(source_url: str | None) -> tuple[str, int] | None:
+    match = re.search(r"github\.com/([^/]+/[^/]+)/issues/(\d+)", source_url or "")
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
 def _gh(args: list[str], *, timeout: int = 120) -> str:
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
     if result.returncode != 0:
@@ -81,7 +88,13 @@ def _recommended_actions(opportunity: dict[str, Any]) -> list[dict[str, Any]]:
             "risk_level": "low",
             "reason": "Post a factual coordination/handoff note on the PR. This is not a code review.",
         })
-    elif "/issues/" in source_url:
+    elif _github_issue_ref(source_url):
+        actions.append({
+            "action_kind": "github_issue_fix_lane",
+            "label": "Fix issue",
+            "risk_level": "high",
+            "reason": "Run a one-click Hermes issue repair lane that prepares a local fix branch, self-audits, runs an independent fresh-session review, then queues a separate Push branch decision.",
+        })
         actions.append({
             "action_kind": "github_issue_comment",
             "label": "Draft GitHub issue comment",
@@ -330,6 +343,67 @@ def _build_ci_fix_lane_payload(opportunity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_github_issue_fix_lane_payload(opportunity: dict[str, Any]) -> dict[str, Any]:
+    ref = _github_issue_ref(opportunity.get("source_url"))
+    if not ref:
+        raise ValueError("Opportunity is not a GitHub issue URL")
+    repo, issue_number = ref
+    cfg = get_visibility_config()
+    if not cfg.github_repo_allowed(repo):
+        raise ValueError(f"Visibility OS is restricted to configured GitHub repositories: {cfg.github_scope_label}")
+    metadata = opportunity.get("metadata") or {}
+    labels = [str(label.get("name") or label) for label in metadata.get("labels") or []]
+    issue_body = str(metadata.get("body") or metadata.get("description") or opportunity.get("description") or "")
+    prompt = "\n".join([
+        f"You are running the Visibility OS automated GitHub issue fix lane for {cfg.company_name}.",
+        "",
+        f"Goal: Fix GitHub issue #{issue_number} by preparing a local code/docs fix branch with a commit and proposed PR message. Do not push the branch or open/update a PR yet.",
+        "",
+        f"Repository: {repo}",
+        f"Issue: #{issue_number}",
+        f"Issue URL: {opportunity.get('source_url')}",
+        f"Issue title: {metadata.get('title') or opportunity.get('title') or ''}",
+        f"Labels: {', '.join(labels) if labels else 'none'}",
+        "",
+        "Issue body / opportunity description:",
+        issue_body[:4000],
+        "",
+        "Execution rules:",
+        "1. Re-check the issue is still open and understand the requested bug fix, documentation change, or implementation task before editing.",
+        "2. Work only inside the named repository and only on the scope described by the issue.",
+        "3. Create a focused local branch and commit the fix locally with a clear commit message.",
+        "4. Add or update the smallest relevant tests/docs and run the smallest relevant verification command that proves the issue fix.",
+        "5. Perform a self-audit second pass on your own fix before committing: inspect the diff, look for regressions, edge cases, security issues, unintended scope creep, and test gaps. Fix any issues the second pass finds.",
+        "6. Draft a PR title and PR body that references the issue with a closing keyword, for example: Fixes #" + str(issue_number) + ".",
+        "7. Do not push the branch, do not open or update a PR, and do not merge. Visibility OS will show the configured approver a separate Push branch button after review.",
+        "8. Include commands run, files changed, and self-audit findings in the proposed PR body.",
+        f"9. Do not deploy, merge, alter production infrastructure, rotate secrets, or touch repositories outside the configured GitHub organisations: {cfg.github_scope_label}.",
+        "",
+        "Final response must be JSON with: branch, commit_sha, commit_message, pr_title, pr_body, verification, changed_files, self_audit, ready_to_push.",
+        "self_audit must be an object with: audit_status, issues_found, fixes_applied, notes.",
+    ])
+    return {
+        "lane": "fix_github_issue",
+        "repo": repo,
+        "issue_number": issue_number,
+        "issue_url": opportunity.get("source_url"),
+        "issue_title": metadata.get("title") or opportunity.get("title"),
+        "issue_body": issue_body,
+        "prompt": prompt,
+        "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-issue-fix", "--toolsets", "terminal,file"],
+        "safety_gates": [
+            "issue_open_recheck",
+            "configured_org_only",
+            "local_verification_before_push",
+            "self_audit_before_push",
+            "independent_review_before_push",
+            "no_push_until_human_approves",
+            "no_deploy_no_merge",
+            "final_evidence_required",
+        ],
+    }
+
+
 def _important_log_lines(log: str) -> list[str]:
     patterns = re.compile(r"(error:|error\b|failed|failure|exception|traceback|assertionerror|npm err|pytest|fatal:|missing|denied)", re.I)
     lines = []
@@ -383,6 +457,24 @@ def draft_action_from_opportunity(opportunity_id: str, *, action_kind: str, targ
             effort_score=opportunity.get("effort_score"),
             approval_reason="Automated CI repair may create local branches and commits, so it requires human approval before execution. Pushing is queued as a separate explicit action.",
         )
+    if action_kind == "github_issue_fix_lane":
+        payload = _build_github_issue_fix_lane_payload(opportunity)
+        return create_action(
+            proposed_by_agent=actor,
+            action_type="github_issue_fix_lane",
+            target_system="hermes",
+            target_location=target_location or f"{payload.get('repo')}#{payload.get('issue_number')}",
+            title=f"Fix GitHub issue #{payload.get('issue_number')}: {opportunity.get('title', '')[:80]}",
+            summary=f"Approval-gated Hermes issue fix lane for opportunity {opportunity_id}.",
+            proposed_payload=payload,
+            evidence_links=evidence_links,
+            risk_level="high",
+            opportunity_id=opportunity_id,
+            impact_score=opportunity.get("impact_score"),
+            visibility_score=opportunity.get("visibility_score"),
+            effort_score=opportunity.get("effort_score"),
+            approval_reason="Automated issue repair may create local branches and commits, so it requires human approval before execution. Pushing is queued as a separate explicit action.",
+        )
     if action_kind == "github_pr_comment":
         action_type = "github_pr_comment"
         target_system = "github"
@@ -428,6 +520,7 @@ def _recommended_label(action_kind: str) -> str:
     return {
         "github_actions_diagnosis": "Diagnose CI",
         "ci_fix_lane": "Start Fix CI lane",
+        "github_issue_fix_lane": "Fix issue",
         "github_pr_comment": "Draft PR coordination comment",
         "github_issue_comment": "Draft issue coordination comment",
         "slack_update": "Draft Slack update",

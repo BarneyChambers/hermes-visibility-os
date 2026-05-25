@@ -6,6 +6,7 @@ Visibility OS is a Hermes dashboard plugin for engineering-lead visibility:
 - correlates CI failures with PR state before proposing work
 - drafts Slack or GitHub updates behind a human approval queue
 - runs a one-click **Fix CI** lane that prepares a local branch, self-audits, launches an independent fresh-session review, then queues a separate **Push branch** decision
+- runs the same one-click **Fix Issue** lane for GitHub issues
 
 ## Configuration
 
@@ -36,7 +37,7 @@ Visibility OS is intentionally scoped by environment configuration:
 
 - GitHub actions and Fix CI lanes reject repositories outside `VISIBILITY_OS_GITHUB_ORGS`.
 - If `VISIBILITY_OS_GITHUB_REPOS` is set, scans and actions are restricted to that explicit repo list.
-- The Fix CI lane prepares local branches only. It does not push, open PRs, merge, or deploy.
+- The Fix CI and Fix Issue lanes prepare local branches only. They do not push, open PRs, merge, or deploy.
 - A separate fresh Hermes session reviews the prepared branch before any push action is queued.
 - Pushing the branch and creating the PR remains a separate explicit human action.
 

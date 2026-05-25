@@ -8,6 +8,7 @@ Visibility OS is a Hermes dashboard plugin for engineering-lead visibility. It s
 - Opportunity scoring based on impact, visibility, effort, safety, and risk
 - Human-approved Slack and GitHub action drafts
 - One-click Fix CI lane that prepares a local branch, self-audits, runs an independent fresh-session review, then queues a separate Push branch decision
+- One-click Fix Issue lane for GitHub issues using the same local-branch, self-audit, independent-review, and push-gate flow
 - Environment-scoped safety gates for allowed GitHub orgs and repos
 
 ## Install in Hermes
@@ -42,7 +43,8 @@ gh auth refresh -h github.com -s repo -s read:org -s workflow
 - GitHub actions and Fix CI lanes reject repositories outside `VISIBILITY_OS_GITHUB_ORGS`.
 - If `VISIBILITY_OS_GITHUB_REPOS` is set, scans and actions are restricted to that explicit repo list.
 - Fix CI prepares local branches only. It does not push, merge, or deploy.
-- An independent fresh Hermes session reviews prepared branches before a push action is queued.
+- Fix Issue uses the same safe local-branch flow for GitHub issues.
+- Independent fresh Hermes sessions review prepared branches before a push action is queued.
 - Pushing remains a separate explicit human decision.
 
 ## Tests

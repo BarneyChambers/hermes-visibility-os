@@ -615,6 +615,129 @@ def test_hermes_executor_prepares_fix_and_queues_push_branch_action(tmp_path, mo
     assert "npm run typecheck" in push_action["proposed_payload"]["pr_body"]
 
 
+
+def test_issue_opportunity_exposes_fix_lane_and_builds_payload(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.core.opportunity_actions import build_opportunity_detail, draft_action_from_opportunity
+
+    opportunity = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/issues/42",
+        title="Bug: settings save fails on mobile",
+        description="Issue #42 appears relevant for small customer facing bug fixes.",
+        category="small_customer_facing_bug_fixes",
+        impact_score=4,
+        visibility_score=4,
+        effort_score=4,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=29,
+        suggested_artifacts=["pull_request", "issue_comment", "slack_update"],
+        metadata={
+            "number": 42,
+            "title": "Bug: settings save fails on mobile",
+            "body": "Saving settings on mobile returns a validation error.",
+            "labels": [{"name": "bug"}],
+            "url": "https://github.com/acme-inc/web-app/issues/42",
+        },
+    )
+
+    detail = build_opportunity_detail(opportunity["id"])
+    assert any(a["action_kind"] == "github_issue_fix_lane" and a["label"] == "Fix issue" for a in detail["recommended_actions"])
+
+    action = draft_action_from_opportunity(opportunity["id"], action_kind="github_issue_fix_lane", actor="human")
+    assert action["action_type"] == "github_issue_fix_lane"
+    assert action["target_system"] == "hermes"
+    assert action["risk_level"] == "high"
+    payload = action["proposed_payload"]
+    assert payload["lane"] == "fix_github_issue"
+    assert payload["repo"] == "acme-inc/web-app"
+    assert payload["issue_number"] == 42
+    assert payload["issue_url"] == opportunity["source_url"]
+    assert "Fix GitHub issue #42" in payload["prompt"]
+    assert "Saving settings on mobile" in payload["prompt"]
+    assert "Do not push" in payload["prompt"]
+    assert "visibility-os-issue-fix" in payload["command"]
+
+
+def test_hermes_executor_prepares_issue_fix_and_queues_push_branch_action(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.actions import create_action, approve_action, list_actions
+    from plugins.visibility_os.core.executors import execute_approved_action
+
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout, check, cwd=None, input=None):
+        calls.append({"args": args, "cwd": cwd, "input": input})
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        r = R()
+        if "visibility-os-issue-review" in args:
+            r.stdout = json.dumps({
+                "review_status": "passed",
+                "findings": [],
+                "fixes_required": [],
+                "notes": "Fresh-session review found no blockers.",
+            })
+        else:
+            r.stdout = json.dumps({
+                "branch": "fix/issue-42-settings-save-mobile",
+                "commit_sha": "def456",
+                "commit_message": "fix: repair mobile settings save",
+                "pr_title": "Fix mobile settings save validation",
+                "pr_body": "## What changed\n- Fixed mobile settings validation\n\nFixes #42\n\n## Verification\n- pytest tests/settings",
+                "verification": ["pytest tests/settings"],
+                "changed_files": ["src/settings.py"],
+                "self_audit": {"audit_status": "passed", "issues_found": [], "fixes_applied": [], "notes": "Second-pass review found no issues."},
+                "ready_to_push": True,
+            })
+        return r
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    action = create_action(
+        proposed_by_agent="human",
+        action_type="github_issue_fix_lane",
+        target_system="hermes",
+        target_location="acme-inc/web-app#42",
+        title="Fix GitHub issue #42",
+        summary="Prepare a local issue fix branch.",
+        proposed_payload={
+            "lane": "fix_github_issue",
+            "repo": "acme-inc/web-app",
+            "issue_number": 42,
+            "issue_url": "https://github.com/acme-inc/web-app/issues/42",
+            "prompt": "Fix GitHub issue #42. Do not push. Do not deploy.",
+            "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-issue-fix", "--toolsets", "terminal,file"],
+            "workdir": str(tmp_path),
+        },
+        evidence_links=[{"type": "issue", "url": "https://github.com/acme-inc/web-app/issues/42"}],
+        risk_level="high",
+    )
+    approve_action(action["id"], actor="reviewer")
+    executed = execute_approved_action(action["id"], actor="reviewer")
+
+    assert executed["status"] == "executed"
+    assert len([c for c in calls if c["args"] and c["args"][0] == "hermes"]) == 2
+    review_call = next(c for c in calls if "visibility-os-issue-review" in c["args"])
+    assert "Fix GitHub issue #42" not in review_call["args"][3]
+    assert "fresh session" in review_call["args"][3].lower()
+    result = executed["execution_result"]
+    assert result["lane"] == "fix_github_issue"
+    assert result["prepared_branch"] == "fix/issue-42-settings-save-mobile"
+    assert result["push_action_id"]
+
+    push_action = next(a for a in list_actions() if a["id"] == result["push_action_id"])
+    assert push_action["status"] == "queued"
+    assert push_action["action_type"] == "github_push_branch"
+    assert push_action["proposed_payload"]["issue_number"] == 42
+    assert push_action["proposed_payload"]["issue_url"] == "https://github.com/acme-inc/web-app/issues/42"
+    assert push_action["proposed_payload"]["independent_review"]["review_status"] == "passed"
+    assert "Fixes #42" in push_action["proposed_payload"]["pr_body"]
+
+
 def test_api_one_click_fix_ci_drafts_approves_executes_and_queues_push(tmp_path, monkeypatch):
     patch_db(tmp_path, monkeypatch)
     from plugins.visibility_os.core.opportunities import upsert_opportunity
@@ -680,6 +803,70 @@ def test_api_one_click_fix_ci_drafts_approves_executes_and_queues_push(tmp_path,
     assert len(push_actions) == 1
     assert push_actions[0]["status"] == "queued"
     assert push_actions[0]["proposed_payload"]["self_audit"]["audit_status"] == "passed"
+    assert push_actions[0]["proposed_payload"]["independent_review"]["review_status"] == "passed"
+
+
+
+def test_api_one_click_fix_issue_drafts_approves_executes_and_queues_push(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.core.actions import list_actions
+    from plugins.visibility_os.dashboard.plugin_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/visibility-os")
+    client = TestClient(app)
+    opportunity = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/issues/42",
+        title="Bug: settings save fails on mobile",
+        description="Issue #42 appears relevant for small customer facing bug fixes.",
+        category="small_customer_facing_bug_fixes",
+        impact_score=4,
+        visibility_score=4,
+        effort_score=4,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=29,
+        suggested_artifacts=["pull_request", "issue_comment"],
+        metadata={"number": 42, "title": "Bug: settings save fails on mobile", "body": "Saving settings on mobile returns a validation error.", "labels": [{"name": "bug"}]},
+    )
+
+    def fake_run(args, capture_output, text, timeout, check, cwd=None, input=None):
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        r = R()
+        if args and args[0] == "hermes" and "visibility-os-issue-review" in args:
+            r.stdout = json.dumps({"review_status": "passed", "findings": [], "fixes_required": [], "notes": "Independent review passed"})
+        elif args and args[0] == "hermes":
+            r.stdout = json.dumps({
+                "branch": "fix/issue-42-settings-save-mobile",
+                "commit_sha": "def456",
+                "commit_message": "fix: repair mobile settings save",
+                "pr_title": "Fix mobile settings save validation",
+                "pr_body": "## Verification\n- pytest tests/settings\n\nFixes #42",
+                "verification": ["pytest tests/settings"],
+                "changed_files": ["src/settings.py"],
+                "self_audit": {"audit_status": "passed", "issues_found": [], "fixes_applied": [], "notes": "ok"},
+                "ready_to_push": True,
+            })
+        return r
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    response = client.post(f"/api/plugins/visibility-os/opportunities/{opportunity['id']}/fix-issue", json={"actor": "reviewer"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "executed"
+    assert body["action_type"] == "github_issue_fix_lane"
+    assert body["execution_result"]["lane"] == "fix_github_issue"
+    assert body["execution_result"]["issue_number"] == 42
+
+    push_actions = [a for a in list_actions() if a["action_type"] == "github_push_branch"]
+    assert len(push_actions) == 1
+    assert push_actions[0]["status"] == "queued"
+    assert push_actions[0]["proposed_payload"]["issue_number"] == 42
     assert push_actions[0]["proposed_payload"]["independent_review"]["review_status"] == "passed"
 
 
@@ -897,6 +1084,9 @@ def test_visibility_os_dashboard_shows_single_fix_ci_button():
     assert "fixCI" in js
     assert "Fix CI" in js
     assert "/fix-ci" in js
+    assert "fixIssue" in js
+    assert "Fix Issue" in js
+    assert "/fix-issue" in js
     assert "Start Fix CI lane" not in js
     assert "Diagnose CI" not in js
     assert "github_actions_diagnosis" not in js

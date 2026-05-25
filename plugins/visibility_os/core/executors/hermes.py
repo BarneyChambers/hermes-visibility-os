@@ -75,15 +75,18 @@ def _parse_independent_review(stdout: str) -> dict[str, Any]:
     return parsed
 
 
-def _build_independent_review_prompt(repo: str, prepared: dict[str, Any]) -> str:
+def _build_independent_review_prompt(repo: str, prepared: dict[str, Any], *, lane_label: str = "CI fix", issue_number: int | None = None) -> str:
+    context = [f"Repository: {repo}"]
+    if issue_number is not None:
+        context.append(f"Issue: #{issue_number}")
     return "\n".join([
-        "You are a fresh session independent reviewer for a prepared CI fix.",
+        f"You are a fresh session independent reviewer for a prepared {lane_label}.",
         "You were not involved in the fix. Do not assume the fix is correct.",
         "Review only the current local repository state, branch, commit/diff, proposed PR text, and verification evidence.",
         "Do not use or rely on the original fixing prompt or the fixing agent's reasoning.",
         "Look for regressions, unintended scope creep, security issues, missing tests, brittle logic, and PR description inaccuracies.",
         "Do not push, merge, deploy, rotate secrets, or touch production infrastructure.",
-        f"Repository: {repo}",
+        *context,
         f"Prepared branch: {prepared.get('branch')}",
         f"Commit: {prepared.get('commit_sha') or 'unknown'}",
         f"Commit message: {prepared.get('commit_message')}",
@@ -98,53 +101,70 @@ def _build_independent_review_prompt(repo: str, prepared: dict[str, Any]) -> str
 
 
 def execute_hermes_action(action: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    if action["action_type"] != "ci_fix_lane":
-        raise RuntimeError(f"Unsupported Hermes action type {action['action_type']}")
-    if payload.get("lane") != "fix_ci":
-        raise RuntimeError("Hermes action payload must declare lane='fix_ci'")
+    action_type = action["action_type"]
+    lane = payload.get("lane")
+    if action_type == "ci_fix_lane":
+        expected_lane = "fix_ci"
+        source = "visibility-os-ci-review"
+        lane_label = "CI fix"
+        default_workspace = "ci-fix-workspaces"
+        push_title = "Push prepared CI fix branch"
+        if payload.get("should_create_fix_branch") is False:
+            raise RuntimeError("Refusing to execute Fix CI lane because diagnosis marked it non-actionable")
+    elif action_type == "github_issue_fix_lane":
+        expected_lane = "fix_github_issue"
+        source = "visibility-os-issue-review"
+        lane_label = "GitHub issue fix"
+        default_workspace = "issue-fix-workspaces"
+        push_title = "Push prepared issue fix branch"
+    else:
+        raise RuntimeError(f"Unsupported Hermes action type {action_type}")
+    if lane != expected_lane:
+        raise RuntimeError(f"Hermes action payload must declare lane='{expected_lane}'")
     repo = payload.get("repo")
     _ensure_allowed_repo(repo)
-    if payload.get("should_create_fix_branch") is False:
-        raise RuntimeError("Refusing to execute Fix CI lane because diagnosis marked it non-actionable")
     prompt = payload.get("prompt")
     if not prompt:
-        raise RuntimeError("Fix CI lane requires a prompt")
-    workdir = payload.get("workdir") or str(Path.home() / ".hermes" / "visibility-os" / "ci-fix-workspaces" / str(repo).replace("/", "__"))
+        raise RuntimeError(f"{lane_label} lane requires a prompt")
+    workdir = payload.get("workdir") or str(Path.home() / ".hermes" / "visibility-os" / default_workspace / str(repo).replace("/", "__"))
     Path(workdir).mkdir(parents=True, exist_ok=True)
-    cmd = _command_with_prompt(payload.get("command") or [], str(prompt))
+    cmd = _command_with_prompt(payload.get("command") or [], str(prompt), source="visibility-os-issue-fix" if action_type == "github_issue_fix_lane" else "visibility-os-ci-fix")
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=int(payload.get("timeout_seconds") or 3600), check=False, cwd=workdir)
     if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "Hermes Fix CI lane failed")
+        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or f"Hermes {lane_label} lane failed")
     prepared = _parse_prepared_fix(res.stdout)
-    review_prompt = _build_independent_review_prompt(str(repo), prepared)
-    review_cmd = _command_with_prompt(payload.get("review_command") or [], review_prompt, source="visibility-os-ci-review")
+    review_prompt = _build_independent_review_prompt(str(repo), prepared, lane_label=lane_label, issue_number=payload.get("issue_number"))
+    review_cmd = _command_with_prompt(payload.get("review_command") or [], review_prompt, source=source)
     review_res = subprocess.run(review_cmd, capture_output=True, text=True, timeout=int(payload.get("review_timeout_seconds") or 1800), check=False, cwd=workdir)
     if review_res.returncode != 0:
-        raise RuntimeError(review_res.stderr.strip() or review_res.stdout.strip() or "Independent Fix CI review failed")
+        raise RuntimeError(review_res.stderr.strip() or review_res.stdout.strip() or f"Independent {lane_label} review failed")
     independent_review = _parse_independent_review(review_res.stdout)
+    push_payload = {
+        "repo": repo,
+        "branch": prepared["branch"],
+        "base_branch": (payload.get("pr_context") or {}).get("base_branch") or prepared.get("base_branch") or "main",
+        "workdir": workdir,
+        "commit_sha": prepared.get("commit_sha"),
+        "commit_message": prepared.get("commit_message"),
+        "pr_title": prepared.get("pr_title") or prepared.get("commit_message"),
+        "pr_body": prepared.get("pr_body"),
+        "verification": prepared.get("verification") or [],
+        "changed_files": prepared.get("changed_files") or [],
+        "self_audit": prepared.get("self_audit") or {},
+        "independent_review": independent_review,
+        "source_run_id": payload.get("run_id"),
+        "source_run_url": payload.get("run_url"),
+        "issue_number": payload.get("issue_number"),
+        "issue_url": payload.get("issue_url"),
+    }
     push_action = create_action(
         proposed_by_agent="visibility_os",
         action_type="github_push_branch",
         target_system="github",
         target_location=f"{repo}#{prepared['branch']}",
-        title=f"Push prepared CI fix branch: {prepared['branch']}",
+        title=f"{push_title}: {prepared['branch']}",
         summary=f"Review and optionally push local branch {prepared['branch']} and create a PR for {repo}.",
-        proposed_payload={
-            "repo": repo,
-            "branch": prepared["branch"],
-            "base_branch": (payload.get("pr_context") or {}).get("base_branch") or prepared.get("base_branch") or "main",
-            "workdir": workdir,
-            "commit_sha": prepared.get("commit_sha"),
-            "commit_message": prepared.get("commit_message"),
-            "pr_title": prepared.get("pr_title") or prepared.get("commit_message"),
-            "pr_body": prepared.get("pr_body"),
-            "verification": prepared.get("verification") or [],
-            "changed_files": prepared.get("changed_files") or [],
-            "self_audit": prepared.get("self_audit") or {},
-            "independent_review": independent_review,
-            "source_run_id": payload.get("run_id"),
-            "source_run_url": payload.get("run_url"),
-        },
+        proposed_payload=push_payload,
         evidence_links=action.get("evidence_links") or [],
         risk_level="high",
         opportunity_id=action.get("opportunity_id"),
@@ -155,10 +175,12 @@ def execute_hermes_action(action: dict[str, Any], payload: dict[str, Any]) -> di
     )
     return {
         "ok": True,
-        "lane": "fix_ci",
+        "lane": lane,
         "mode": "prepared_local_branch_only",
         "repo": repo,
         "run_id": payload.get("run_id"),
+        "issue_number": payload.get("issue_number"),
+        "issue_url": payload.get("issue_url"),
         "prepared_branch": prepared["branch"],
         "commit_sha": prepared.get("commit_sha"),
         "commit_message": prepared.get("commit_message"),
