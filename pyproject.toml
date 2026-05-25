@@ -1,0 +1,11 @@
+[project]
+name = "hermes-visibility-os"
+version = "0.1.0"
+description = "Hermes dashboard plugin for engineering visibility and human-approved action drafts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
