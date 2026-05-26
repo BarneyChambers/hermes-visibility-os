@@ -56,18 +56,25 @@ def _parse_prepared_fix(stdout: str) -> dict[str, Any]:
     return parsed
 
 
-def _parse_independent_review(stdout: str) -> dict[str, Any]:
+def _parse_json_object(stdout: str, *, label: str) -> dict[str, Any]:
     text = (stdout or "").strip()
     if not text:
-        raise RuntimeError("Independent Fix CI review returned no JSON payload")
+        raise RuntimeError(f"{label} returned no JSON payload")
     try:
         parsed = json.loads(text)
     except Exception:
         match = re.search(r"\{.*\}", text, re.S)
         if not match:
-            raise RuntimeError("Independent Fix CI review must return JSON")
+            raise RuntimeError(f"{label} must return JSON")
         parsed = json.loads(match.group(0))
-    if not isinstance(parsed, dict) or not parsed.get("review_status"):
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{label} JSON must be an object")
+    return parsed
+
+
+def _parse_independent_review(stdout: str) -> dict[str, Any]:
+    parsed = _parse_json_object(stdout, label="Independent Fix CI review")
+    if not parsed.get("review_status"):
         raise RuntimeError("Independent Fix CI review requires review_status")
     status = str(parsed.get("review_status")).lower()
     if status not in {"passed", "approved", "no_blockers"}:
@@ -100,11 +107,47 @@ def _build_independent_review_prompt(repo: str, prepared: dict[str, Any], *, lan
     ])
 
 
+def _execute_pr_review_lane(action: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("lane") != "review_pr":
+        raise RuntimeError("Hermes PR review payload must declare lane='review_pr'")
+    repo = payload.get("repo")
+    _ensure_allowed_repo(repo)
+    prompt = payload.get("prompt")
+    if not prompt:
+        raise RuntimeError("PR review lane requires a prompt")
+    workdir = payload.get("workdir") or str(Path.home() / ".hermes" / "visibility-os" / "pr-review-workspaces" / str(repo).replace("/", "__"))
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    cmd = _command_with_prompt(payload.get("command") or [], str(prompt), source="visibility-os-pr-review")
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=int(payload.get("timeout_seconds") or 1800), check=False, cwd=workdir)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "Hermes PR review lane failed")
+    review = _parse_json_object(res.stdout, label="Hermes PR review lane")
+    if not review.get("review_status") or not review.get("body"):
+        raise RuntimeError("Hermes PR review lane requires review_status and body")
+    post_action = create_action(
+        proposed_by_agent="visibility_os",
+        action_type="github_pr_comment",
+        target_system="github",
+        target_location=payload.get("pr_url") or action.get("target_location") or "",
+        title=f"Post PR review: {payload.get('repo')}#{payload.get('pr_number')}",
+        summary="Review and optionally post the fresh-session Hermes PR review comment.",
+        proposed_payload={"body": review["body"], "review_status": review.get("review_status"), "findings": review.get("findings") or [], "notes": review.get("notes")},
+        evidence_links=action.get("evidence_links") or [],
+        risk_level="medium",
+        opportunity_id=action.get("opportunity_id"),
+        impact_score=action.get("impact_score"),
+        visibility_score=action.get("visibility_score"),
+        effort_score=action.get("effort_score"),
+        approval_reason="Posts an external GitHub PR review/comment, so a human approver must explicitly approve it.",
+    )
+    return {"ok": True, "lane": "review_pr", "repo": repo, "pr_number": payload.get("pr_number"), "review_status": review.get("review_status"), "post_action_id": post_action["id"], "review": review, "stdout": res.stdout.strip(), "stderr": res.stderr.strip(), "command": cmd[:3] + ["..."], "workdir": workdir}
+
+
 def execute_hermes_action(action: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     action_type = action["action_type"]
     lane = payload.get("lane")
     if action_type == "ci_fix_lane":
-        expected_lane = "fix_ci"
+        expected_lanes = {"fix_ci"}
         source = "visibility-os-ci-review"
         lane_label = "CI fix"
         default_workspace = "ci-fix-workspaces"
@@ -112,15 +155,29 @@ def execute_hermes_action(action: dict[str, Any], payload: dict[str, Any]) -> di
         if payload.get("should_create_fix_branch") is False:
             raise RuntimeError("Refusing to execute Fix CI lane because diagnosis marked it non-actionable")
     elif action_type == "github_issue_fix_lane":
-        expected_lane = "fix_github_issue"
+        expected_lanes = {"fix_github_issue", "fix_docs", "fix_bug", "deflake_test"}
         source = "visibility-os-issue-review"
         lane_label = "GitHub issue fix"
         default_workspace = "issue-fix-workspaces"
         push_title = "Push prepared issue fix branch"
+    elif action_type == "pr_ci_fix_lane":
+        expected_lanes = {"fix_pr_ci"}
+        source = "visibility-os-pr-ci-review"
+        lane_label = "PR CI fix"
+        default_workspace = "pr-ci-fix-workspaces"
+        push_title = "Push prepared PR CI fix branch"
+    elif action_type == "wip_handoff_lane":
+        expected_lanes = {"prepare_handoff_branch"}
+        source = "visibility-os-wip-handoff-review"
+        lane_label = "WIP handoff"
+        default_workspace = "wip-handoff-workspaces"
+        push_title = "Push prepared WIP handoff branch"
+    elif action_type == "github_pr_review_lane":
+        return _execute_pr_review_lane(action, payload)
     else:
         raise RuntimeError(f"Unsupported Hermes action type {action_type}")
-    if lane != expected_lane:
-        raise RuntimeError(f"Hermes action payload must declare lane='{expected_lane}'")
+    if lane not in expected_lanes:
+        raise RuntimeError(f"Hermes action payload must declare lane in {sorted(expected_lanes)}")
     repo = payload.get("repo")
     _ensure_allowed_repo(repo)
     prompt = payload.get("prompt")

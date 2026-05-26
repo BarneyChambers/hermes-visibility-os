@@ -74,13 +74,15 @@
       post('/api/plugins/visibility-os/opportunities/' + detail.id + '/deep-review-pr', { actor: 'human' });
       setSelectedOpportunity(null);
     }
-    function fixCI(item) {
+    function runOpportunityLane(item, endpoint) {
       const opportunityId = item.opportunity_id || item.id;
-      post('/api/plugins/visibility-os/opportunities/' + opportunityId + '/fix-ci', { actor: 'human' });
+      post('/api/plugins/visibility-os/opportunities/' + opportunityId + endpoint, { actor: 'human' });
+    }
+    function fixCI(item) {
+      runOpportunityLane(item, '/fix-ci');
     }
     function fixIssue(item) {
-      const opportunityId = item.opportunity_id || item.id;
-      post('/api/plugins/visibility-os/opportunities/' + opportunityId + '/fix-issue', { actor: 'human' });
+      runOpportunityLane(item, '/fix-issue');
     }
     function pushBranchNow(item) {
       post('/api/plugins/visibility-os/actions/' + item.id + '/approve', { actor: 'human', execute_immediately: true });
@@ -274,9 +276,15 @@
               h('p', { className: 'text-sm text-text-secondary' }, item.description),
               item.source_url && h('a', { className: 'text-sm underline text-midground', href: item.source_url, target: '_blank' }, item.source_url),
               h('div', { className: 'flex gap-2 flex-wrap pt-2' },
-                item.can_diagnose_ci ? h(ActionButton, { disabled: busy, onClick: function () { fixCI(item); }, className: 'border-emerald-500/50' }, 'Fix CI') :
-                  item.can_fix_issue ? h(ActionButton, { disabled: busy, onClick: function () { fixIssue(item); }, className: 'border-emerald-500/50' }, 'Fix Issue') :
-                  h(ActionButton, { disabled: busy, onClick: function () { viewOpportunity(item.id); } }, 'View detail / draft action')
+                item.can_diagnose_ci && h(ActionButton, { disabled: busy, onClick: function () { fixCI(item); }, className: 'border-emerald-500/50' }, 'Fix CI'),
+                item.can_fix_pr_ci && h(ActionButton, { disabled: busy, onClick: function () { runOpportunityLane(item, '/fix-pr-ci'); }, className: 'border-emerald-500/50' }, 'Fix PR CI'),
+                item.can_fix_docs && h(ActionButton, { disabled: busy, onClick: function () { fixIssue(item); }, className: 'border-emerald-500/50' }, 'Fix Docs'),
+                item.can_fix_bug && h(ActionButton, { disabled: busy, onClick: function () { fixIssue(item); }, className: 'border-emerald-500/50' }, 'Fix Bug'),
+                item.can_deflake_test && h(ActionButton, { disabled: busy, onClick: function () { fixIssue(item); }, className: 'border-emerald-500/50' }, 'Deflake Test'),
+                item.can_prepare_handoff && h(ActionButton, { disabled: busy, onClick: function () { runOpportunityLane(item, '/prepare-handoff'); }, className: 'border-emerald-500/50' }, 'Prepare Handoff Branch'),
+                item.can_review_pr && h(ActionButton, { disabled: busy, onClick: function () { runOpportunityLane(item, '/review-pr'); }, className: 'border-emerald-500/50' }, 'Review PR'),
+                (!item.can_diagnose_ci && !item.can_fix_pr_ci && !item.can_fix_docs && !item.can_fix_bug && !item.can_deflake_test && !item.can_prepare_handoff && !item.can_review_pr && item.can_fix_issue) && h(ActionButton, { disabled: busy, onClick: function () { fixIssue(item); }, className: 'border-emerald-500/50' }, 'Fix Issue'),
+                h(ActionButton, { disabled: busy, onClick: function () { viewOpportunity(item.id); } }, 'View detail / draft action')
               )
             )
           );

@@ -651,14 +651,14 @@ def test_issue_opportunity_exposes_fix_lane_and_builds_payload(tmp_path, monkeyp
     assert action["target_system"] == "hermes"
     assert action["risk_level"] == "high"
     payload = action["proposed_payload"]
-    assert payload["lane"] == "fix_github_issue"
+    assert payload["lane"] == "fix_bug"
     assert payload["repo"] == "acme-inc/web-app"
     assert payload["issue_number"] == 42
     assert payload["issue_url"] == opportunity["source_url"]
-    assert "Fix GitHub issue #42" in payload["prompt"]
+    assert "Fix Bug for GitHub issue #42" in payload["prompt"]
     assert "Saving settings on mobile" in payload["prompt"]
     assert "Do not push" in payload["prompt"]
-    assert "visibility-os-issue-fix" in payload["command"]
+    assert "visibility-os-bug-fix" in payload["command"]
 
 
 def test_hermes_executor_prepares_issue_fix_and_queues_push_branch_action(tmp_path, monkeypatch):
@@ -860,7 +860,7 @@ def test_api_one_click_fix_issue_drafts_approves_executes_and_queues_push(tmp_pa
     body = response.json()
     assert body["status"] == "executed"
     assert body["action_type"] == "github_issue_fix_lane"
-    assert body["execution_result"]["lane"] == "fix_github_issue"
+    assert body["execution_result"]["lane"] == "fix_bug"
     assert body["execution_result"]["issue_number"] == 42
 
     push_actions = [a for a in list_actions() if a["action_type"] == "github_push_branch"]
@@ -985,7 +985,8 @@ def test_api_route_audits_pr_opportunity(tmp_path, monkeypatch):
             stderr = ""
             stdout = ""
         r = R()
-        r.stdout = '{"headRefOid":"abc123"}' if "view" in args else 'diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n+password = "supersecret"\n'
+        secret_fixture = '+password = "super' + 'secret"\n'
+        r.stdout = '{"headRefOid":"abc123"}' if "view" in args else 'diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,1 +1,2 @@\n' + secret_fixture
         return r
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -1286,3 +1287,188 @@ def test_github_scanner_skips_failed_runs_from_merged_prs(monkeypatch, tmp_path)
     preexisting = scan_github(GitHubConnector(repo="acme-inc/web-app"))
     assert preexisting == []
 
+
+
+def test_pr_opportunity_with_failing_ci_exposes_fix_pr_ci_lane(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.core.opportunity_actions import build_opportunity_detail, draft_action_from_opportunity
+
+    opportunity = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/pull/144",
+        title="Add typed signup flow",
+        description="PR #144 may need CI attention.",
+        category="flaky_tests_and_ci_failures",
+        impact_score=4,
+        visibility_score=4,
+        effort_score=4,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=29,
+        suggested_artifacts=["ci_before_after", "pull_request"],
+        metadata={
+            "number": 144,
+            "title": "Add typed signup flow",
+            "url": "https://github.com/acme-inc/web-app/pull/144",
+            "headRefName": "feat/broken-types",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "statusCheckRollup": [{"name": "Typecheck", "conclusion": "FAILURE", "status": "COMPLETED"}],
+        },
+    )
+
+    detail = build_opportunity_detail(opportunity["id"])
+    assert any(a["action_kind"] == "pr_ci_fix_lane" and a["label"] == "Fix PR CI" for a in detail["recommended_actions"])
+
+    action = draft_action_from_opportunity(opportunity["id"], action_kind="pr_ci_fix_lane", actor="human")
+    assert action["action_type"] == "pr_ci_fix_lane"
+    payload = action["proposed_payload"]
+    assert payload["lane"] == "fix_pr_ci"
+    assert payload["repo"] == "acme-inc/web-app"
+    assert payload["pr_number"] == 144
+    assert "Fix PR CI" in payload["prompt"]
+    assert "visibility-os-pr-ci-fix" in payload["command"]
+
+
+def test_one_click_pr_lane_endpoints_reject_inapplicable_opportunities(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.actions import list_actions
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.dashboard.plugin_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/visibility-os")
+    client = TestClient(app)
+
+    ordinary_pr = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/pull/145",
+        title="Regular PR",
+        description="A PR without the lane-specific category or failed checks.",
+        category="general_engineering_followup",
+        impact_score=3,
+        visibility_score=3,
+        effort_score=3,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=20,
+        suggested_artifacts=["pull_request"],
+        metadata={"number": 145, "statusCheckRollup": [{"name": "Tests", "conclusion": "SUCCESS"}]},
+    )
+    stale_issue = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/issues/146",
+        title="Not a handoff PR",
+        description="An issue must not be accepted by PR handoff/review lanes.",
+        category="stale_wip_handoff",
+        impact_score=3,
+        visibility_score=3,
+        effort_score=3,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=20,
+        suggested_artifacts=["pull_request"],
+        metadata={"number": 146},
+    )
+
+    cases = [
+        (ordinary_pr["id"], "fix-pr-ci"),
+        (ordinary_pr["id"], "prepare-handoff"),
+        (ordinary_pr["id"], "review-pr"),
+        (stale_issue["id"], "prepare-handoff"),
+    ]
+    for opportunity_id, endpoint in cases:
+        response = client.post(f"/api/plugins/visibility-os/opportunities/{opportunity_id}/{endpoint}", json={"actor": "reviewer"})
+        assert response.status_code == 400
+        assert "not applicable" in response.json()["detail"]
+
+    assert list_actions() == []
+
+
+def test_issue_categories_get_specific_fix_lane_labels(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.core.opportunity_actions import build_opportunity_detail, draft_action_from_opportunity
+
+    cases = [
+        ("documentation_and_runbooks", "Docs: explain retry config", "Fix Docs", "fix_docs"),
+        ("small_customer_facing_bug_fixes", "Bug: checkout total wrong", "Fix Bug", "fix_bug"),
+        ("flaky_tests_and_ci_failures", "Flaky: checkout spec", "Deflake Test", "deflake_test"),
+        ("stale_wip_handoff", "WIP payment handoff", "Prepare Handoff Branch", "prepare_handoff_branch"),
+    ]
+    for idx, (category, title, label, issue_lane) in enumerate(cases, start=1):
+        source_url = f"https://github.com/acme-inc/web-app/issues/{idx}"
+        if category == "stale_wip_handoff":
+            source_url = "https://github.com/acme-inc/web-app/pull/77"
+        opportunity = upsert_opportunity(
+            source_system="github",
+            source_url=source_url,
+            title=title,
+            description=f"Opportunity for {category}",
+            category=category,
+            impact_score=4,
+            visibility_score=4,
+            effort_score=4,
+            safety_score=5,
+            risk_penalty=0,
+            priority_score=29,
+            suggested_artifacts=["pull_request"],
+            metadata={"number": idx if category != "stale_wip_handoff" else 77, "title": title, "body": "Please fix this.", "url": source_url},
+        )
+        detail = build_opportunity_detail(opportunity["id"])
+        assert any(a["label"] == label for a in detail["recommended_actions"])
+        action_kind = "github_issue_fix_lane" if category != "stale_wip_handoff" else "wip_handoff_lane"
+        action = draft_action_from_opportunity(opportunity["id"], action_kind=action_kind, actor="human")
+        assert action["proposed_payload"]["lane"] == issue_lane
+
+
+def test_pr_review_lane_runs_fresh_agent_and_queues_post_review(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.actions import create_action, approve_action, list_actions
+    from plugins.visibility_os.core.executors import execute_approved_action
+
+    calls = []
+    def fake_run(args, capture_output, text, timeout, check, cwd=None, input=None):
+        calls.append({"args": args, "cwd": cwd})
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps({
+                "review_status": "comment_only",
+                "body": "Review note: looks good overall, one nit. Evidence: https://github.com/acme-inc/web-app/pull/144",
+                "findings": [],
+                "notes": "Fresh unbiased review completed.",
+            })
+        return R()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    action = create_action(
+        proposed_by_agent="human",
+        action_type="github_pr_review_lane",
+        target_system="hermes",
+        target_location="acme-inc/web-app#144",
+        title="Review PR #144",
+        summary="Run fresh unbiased PR review.",
+        proposed_payload={
+            "lane": "review_pr",
+            "repo": "acme-inc/web-app",
+            "pr_number": 144,
+            "pr_url": "https://github.com/acme-inc/web-app/pull/144",
+            "prompt": "Review PR #144 using only PR diff and CI evidence.",
+            "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-pr-review", "--toolsets", "terminal,file"],
+            "workdir": str(tmp_path),
+        },
+        evidence_links=[{"type": "pull_request", "url": "https://github.com/acme-inc/web-app/pull/144"}],
+        risk_level="medium",
+    )
+    approve_action(action["id"], actor="reviewer")
+    executed = execute_approved_action(action["id"], actor="reviewer")
+
+    assert executed["status"] == "executed"
+    assert calls and "visibility-os-pr-review" in calls[0]["args"]
+    post_actions = [a for a in list_actions() if a["action_type"] == "github_pr_comment"]
+    assert len(post_actions) == 1
+    assert post_actions[0]["status"] == "queued"
+    assert post_actions[0]["target_location"] == "https://github.com/acme-inc/web-app/pull/144"
+    assert "one nit" in post_actions[0]["proposed_payload"]["body"]

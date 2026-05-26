@@ -71,8 +71,32 @@ def _is_github_actions_run_url(url: str | None) -> bool:
     return bool(url and "/actions/runs/" in url)
 
 
+def _is_github_pull_url(url: str | None) -> bool:
+    return bool(url and "/pull/" in url)
+
+
 def _is_github_issue_url(url: str | None) -> bool:
     return bool(url and "/issues/" in url)
+
+
+def _opportunity_capabilities(opportunity: dict[str, Any]) -> dict[str, bool]:
+    url = opportunity.get("source_url")
+    category = opportunity.get("category") or ""
+    metadata = opportunity.get("metadata") or {}
+    failing_pr = _is_github_pull_url(url) and category == "flaky_tests_and_ci_failures" and any(
+        isinstance(c, dict) and str(c.get("conclusion") or "").upper() == "FAILURE"
+        for c in metadata.get("statusCheckRollup") or []
+    )
+    return {
+        "can_diagnose_ci": _is_github_actions_run_url(url),
+        "can_fix_issue": _is_github_issue_url(url),
+        "can_fix_pr_ci": failing_pr,
+        "can_fix_docs": _is_github_issue_url(url) and category == "documentation_and_runbooks",
+        "can_fix_bug": _is_github_issue_url(url) and category == "small_customer_facing_bug_fixes",
+        "can_deflake_test": _is_github_issue_url(url) and category == "flaky_tests_and_ci_failures",
+        "can_prepare_handoff": _is_github_pull_url(url) and category == "stale_wip_handoff",
+        "can_review_pr": _is_github_pull_url(url) and category == "pr_review_acceleration",
+    }
 
 
 def _feed_action(action: dict[str, Any]) -> dict[str, Any]:
@@ -87,8 +111,7 @@ def _feed_action(action: dict[str, Any]) -> dict[str, Any]:
     source_url = opportunity.get("source_url")
     item["opportunity_source_url"] = source_url
     item["opportunity_title"] = opportunity.get("title")
-    item["can_diagnose_ci"] = _is_github_actions_run_url(source_url)
-    item["can_fix_issue"] = _is_github_issue_url(source_url)
+    item.update(_opportunity_capabilities(opportunity))
     return item
 
 
@@ -119,8 +142,7 @@ async def feed() -> dict[str, Any]:
     for a in actions:
         items.append(_feed_action(a))
     for o in opportunities:
-        source_url = o.get("source_url")
-        items.append({"kind": "opportunity", "can_diagnose_ci": _is_github_actions_run_url(source_url), "can_fix_issue": _is_github_issue_url(source_url), **o})
+        items.append({"kind": "opportunity", **_opportunity_capabilities(o), **o})
     items.sort(key=lambda x: (x.get("created_at") or x.get("updated_at") or ""), reverse=True)
     return {"items": items, "counts": {"actions": len(actions), "opportunities": len(opportunities)}}
 
@@ -198,12 +220,27 @@ async def draft_opportunity_action(opportunity_id: str, body: OpportunityDraftBo
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+def _draft_approve_execute_opportunity_lane(opportunity_id: str, *, action_kind: str, actor: str) -> dict[str, Any]:
+    opportunity = get_opportunity(opportunity_id)
+    capability_by_action = {
+        "ci_fix_lane": "can_diagnose_ci",
+        "github_issue_fix_lane": "can_fix_issue",
+        "pr_ci_fix_lane": "can_fix_pr_ci",
+        "wip_handoff_lane": "can_prepare_handoff",
+        "github_pr_review_lane": "can_review_pr",
+    }
+    capability = capability_by_action.get(action_kind)
+    if capability and not _opportunity_capabilities(opportunity).get(capability):
+        raise ValueError(f"{action_kind} is not applicable to this opportunity")
+    action = draft_action_from_opportunity(opportunity_id, action_kind=action_kind, actor=actor)
+    approve_action(action["id"], actor=actor)
+    return execute_approved_action(action["id"], actor=actor)
+
+
 @router.post("/opportunities/{opportunity_id}/fix-ci")
 async def fix_ci_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
     try:
-        action = draft_action_from_opportunity(opportunity_id, action_kind="ci_fix_lane", actor=body.actor)
-        approve_action(action["id"], actor=body.actor)
-        return execute_approved_action(action["id"], actor=body.actor)
+        return _draft_approve_execute_opportunity_lane(opportunity_id, action_kind="ci_fix_lane", actor=body.actor)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -212,14 +249,41 @@ async def fix_ci_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, 
 @router.post("/opportunities/{opportunity_id}/fix-issue")
 async def fix_issue_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
     try:
-        action = draft_action_from_opportunity(opportunity_id, action_kind="github_issue_fix_lane", actor=body.actor)
-        approve_action(action["id"], actor=body.actor)
-        return execute_approved_action(action["id"], actor=body.actor)
+        return _draft_approve_execute_opportunity_lane(opportunity_id, action_kind="github_issue_fix_lane", actor=body.actor)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+@router.post("/opportunities/{opportunity_id}/fix-pr-ci")
+async def fix_pr_ci_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
+    try:
+        return _draft_approve_execute_opportunity_lane(opportunity_id, action_kind="pr_ci_fix_lane", actor=body.actor)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/opportunities/{opportunity_id}/prepare-handoff")
+async def prepare_handoff_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
+    try:
+        return _draft_approve_execute_opportunity_lane(opportunity_id, action_kind="wip_handoff_lane", actor=body.actor)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/opportunities/{opportunity_id}/review-pr")
+async def review_pr_lane_opportunity(opportunity_id: str, body: ActorBody) -> dict[str, Any]:
+    try:
+        return _draft_approve_execute_opportunity_lane(opportunity_id, action_kind="github_pr_review_lane", actor=body.actor)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/opportunities/{opportunity_id}/audit-pr")
 async def audit_pr_opportunity(opportunity_id: str, body: OpportunityAuditBody) -> dict[str, Any]:

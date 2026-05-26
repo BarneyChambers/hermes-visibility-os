@@ -37,6 +37,30 @@ def _github_issue_ref(source_url: str | None) -> tuple[str, int] | None:
     return match.group(1), int(match.group(2))
 
 
+def _github_pr_ref(source_url: str | None) -> tuple[str, int] | None:
+    match = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", source_url or "")
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def _has_failing_check(metadata: dict[str, Any]) -> bool:
+    return any(
+        isinstance(c, dict) and str(c.get("conclusion") or "").upper() == "FAILURE"
+        for c in metadata.get("statusCheckRollup") or []
+    )
+
+
+def _issue_lane_for_category(category: str) -> tuple[str, str, str]:
+    if category == "documentation_and_runbooks":
+        return "fix_docs", "Fix Docs", "visibility-os-docs-fix"
+    if category == "small_customer_facing_bug_fixes":
+        return "fix_bug", "Fix Bug", "visibility-os-bug-fix"
+    if category == "flaky_tests_and_ci_failures":
+        return "deflake_test", "Deflake Test", "visibility-os-deflake-test"
+    return "fix_github_issue", "Fix Issue", "visibility-os-issue-fix"
+
+
 def _gh(args: list[str], *, timeout: int = 120) -> str:
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
     if result.returncode != 0:
@@ -67,6 +91,8 @@ def _score_explanation(opportunity: dict[str, Any]) -> str:
 def _recommended_actions(opportunity: dict[str, Any]) -> list[dict[str, Any]]:
     source_url = opportunity.get("source_url") or ""
     category = opportunity.get("category") or ""
+    metadata = opportunity.get("metadata") or {}
+    pr_ref = _github_pr_ref(source_url)
     actions: list[dict[str, Any]] = []
     if _github_actions_ref(source_url):
         actions.append({
@@ -81,6 +107,20 @@ def _recommended_actions(opportunity: dict[str, Any]) -> list[dict[str, Any]]:
             "risk_level": "high",
             "reason": "If diagnosis proves the failure is actionable, queue an approval-gated Hermes repair lane to prepare a local fix branch, commit, PR title/body, and verification evidence for human review before any push.",
         })
+    if pr_ref and category == "flaky_tests_and_ci_failures" and _has_failing_check(metadata):
+        actions.append({
+            "action_kind": "pr_ci_fix_lane",
+            "label": "Fix PR CI",
+            "risk_level": "high",
+            "reason": "Run the one-click local PR CI repair lane: prepare branch, self-audit, independent fresh-session review, then queue a separate Push branch decision.",
+        })
+    if pr_ref and category == "stale_wip_handoff":
+        actions.append({
+            "action_kind": "wip_handoff_lane",
+            "label": "Prepare Handoff Branch",
+            "risk_level": "high",
+            "reason": "Conservatively continue or package a stale WIP branch locally, self-audit, run independent review, then queue Push branch only if safe.",
+        })
     if "/pull/" in source_url or category in {"pr_review_acceleration", "stale_wip_handoff"}:
         actions.append({
             "action_kind": "github_pr_comment",
@@ -88,13 +128,28 @@ def _recommended_actions(opportunity: dict[str, Any]) -> list[dict[str, Any]]:
             "risk_level": "low",
             "reason": "Post a factual coordination/handoff note on the PR. This is not a code review.",
         })
+    if pr_ref and category == "pr_review_acceleration":
+        actions.append({
+            "action_kind": "github_pr_review_lane",
+            "label": "Review PR",
+            "risk_level": "medium",
+            "reason": "Run a fresh unbiased Hermes PR review and queue a separate human-approved Post review action.",
+        })
     elif _github_issue_ref(source_url):
+        _, label, _ = _issue_lane_for_category(category)
         actions.append({
             "action_kind": "github_issue_fix_lane",
-            "label": "Fix issue",
+            "label": label,
             "risk_level": "high",
             "reason": "Run a one-click Hermes issue repair lane that prepares a local fix branch, self-audits, runs an independent fresh-session review, then queues a separate Push branch decision.",
         })
+        if label != "Fix Issue":
+            actions.append({
+                "action_kind": "github_issue_fix_lane",
+                "label": "Fix issue",
+                "risk_level": "high",
+                "reason": "Generic issue fix lane alias for this opportunity.",
+            })
         actions.append({
             "action_kind": "github_issue_comment",
             "label": "Draft GitHub issue comment",
@@ -352,12 +407,13 @@ def _build_github_issue_fix_lane_payload(opportunity: dict[str, Any]) -> dict[st
     if not cfg.github_repo_allowed(repo):
         raise ValueError(f"Visibility OS is restricted to configured GitHub repositories: {cfg.github_scope_label}")
     metadata = opportunity.get("metadata") or {}
+    lane, label, source = _issue_lane_for_category(opportunity.get("category") or "")
     labels = [str(label.get("name") or label) for label in metadata.get("labels") or []]
     issue_body = str(metadata.get("body") or metadata.get("description") or opportunity.get("description") or "")
     prompt = "\n".join([
-        f"You are running the Visibility OS automated GitHub issue fix lane for {cfg.company_name}.",
+        f"You are running the Visibility OS automated {label} lane for {cfg.company_name}.",
         "",
-        f"Goal: Fix GitHub issue #{issue_number} by preparing a local code/docs fix branch with a commit and proposed PR message. Do not push the branch or open/update a PR yet.",
+        f"Goal: {label} for GitHub issue #{issue_number} by preparing a local code/docs fix branch with a commit and proposed PR message. Do not push the branch or open/update a PR yet.",
         "",
         f"Repository: {repo}",
         f"Issue: #{issue_number}",
@@ -372,7 +428,7 @@ def _build_github_issue_fix_lane_payload(opportunity: dict[str, Any]) -> dict[st
         "1. Re-check the issue is still open and understand the requested bug fix, documentation change, or implementation task before editing.",
         "2. Work only inside the named repository and only on the scope described by the issue.",
         "3. Create a focused local branch and commit the fix locally with a clear commit message.",
-        "4. Add or update the smallest relevant tests/docs and run the smallest relevant verification command that proves the issue fix.",
+        "4. Add or update the smallest relevant tests/docs and run the smallest relevant verification command that proves the fix. For docs, check accuracy and links. For bugs, prefer a regression test. For flakes, do not weaken or delete meaningful assertions.",
         "5. Perform a self-audit second pass on your own fix before committing: inspect the diff, look for regressions, edge cases, security issues, unintended scope creep, and test gaps. Fix any issues the second pass finds.",
         "6. Draft a PR title and PR body that references the issue with a closing keyword, for example: Fixes #" + str(issue_number) + ".",
         "7. Do not push the branch, do not open or update a PR, and do not merge. Visibility OS will show the configured approver a separate Push branch button after review.",
@@ -383,14 +439,14 @@ def _build_github_issue_fix_lane_payload(opportunity: dict[str, Any]) -> dict[st
         "self_audit must be an object with: audit_status, issues_found, fixes_applied, notes.",
     ])
     return {
-        "lane": "fix_github_issue",
+        "lane": lane,
         "repo": repo,
         "issue_number": issue_number,
         "issue_url": opportunity.get("source_url"),
         "issue_title": metadata.get("title") or opportunity.get("title"),
         "issue_body": issue_body,
         "prompt": prompt,
-        "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-issue-fix", "--toolsets", "terminal,file"],
+        "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", source, "--toolsets", "terminal,file"],
         "safety_gates": [
             "issue_open_recheck",
             "configured_org_only",
@@ -402,6 +458,88 @@ def _build_github_issue_fix_lane_payload(opportunity: dict[str, Any]) -> dict[st
             "final_evidence_required",
         ],
     }
+
+
+def _build_pr_ci_fix_lane_payload(opportunity: dict[str, Any]) -> dict[str, Any]:
+    ref = _github_pr_ref(opportunity.get("source_url"))
+    if not ref:
+        raise ValueError("Opportunity is not a GitHub PR URL")
+    repo, pr_number = ref
+    cfg = get_visibility_config()
+    if not cfg.github_repo_allowed(repo):
+        raise ValueError(f"Visibility OS is restricted to configured GitHub repositories: {cfg.github_scope_label}")
+    metadata = opportunity.get("metadata") or {}
+    failing_checks = [c for c in metadata.get("statusCheckRollup") or [] if isinstance(c, dict) and str(c.get("conclusion") or "").upper() == "FAILURE"]
+    prompt = "\n".join([
+        f"You are running the Visibility OS automated Fix PR CI lane for {cfg.company_name}.",
+        "",
+        f"Goal: Fix PR CI for PR #{pr_number} by preparing a local branch with a commit and proposed PR message. Do not push the branch or open/update a PR yet.",
+        "",
+        f"Repository: {repo}",
+        f"PR: #{pr_number}",
+        f"PR URL: {opportunity.get('source_url')}",
+        f"PR title: {metadata.get('title') or opportunity.get('title') or ''}",
+        f"Head branch: {metadata.get('headRefName') or metadata.get('headBranch') or 'unknown'}",
+        f"Base branch: {metadata.get('baseRefName') or 'main'}",
+        "Failing checks: " + json.dumps(failing_checks),
+        "",
+        "Execution rules:",
+        "1. Re-check that the PR is still open and its latest CI is still failing before making changes.",
+        "2. Work only inside the named repository and only on the PR CI failure scope.",
+        "3. Create a focused local fix branch and commit the fix locally with a clear commit message.",
+        "4. Reproduce the failing command locally when possible, then run the smallest relevant verification command that proves the fix.",
+        "5. Perform a self-audit second pass on your own diff before committing: regressions, edge cases, security issues, scope creep, and test gaps.",
+        "6. Draft a PR title/body with before/after CI evidence and commands run.",
+        "7. Do not push the branch, do not open or update a PR, and do not merge. Visibility OS will queue a separate Push branch button after independent review.",
+        f"8. Do not deploy, merge, alter production infrastructure, rotate secrets, or touch repositories outside: {cfg.github_scope_label}.",
+        "",
+        "Final response must be JSON with: branch, commit_sha, commit_message, pr_title, pr_body, verification, changed_files, self_audit, ready_to_push.",
+        "self_audit must be an object with: audit_status, issues_found, fixes_applied, notes.",
+    ])
+    return {"lane": "fix_pr_ci", "repo": repo, "pr_number": pr_number, "pr_url": opportunity.get("source_url"), "pr_context": {"number": pr_number, "base_branch": metadata.get("baseRefName") or "main"}, "prompt": prompt, "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-pr-ci-fix", "--toolsets", "terminal,file"], "safety_gates": ["pr_open_recheck", "configured_org_only", "local_verification_before_push", "self_audit_before_push", "independent_review_before_push", "no_push_until_human_approves", "no_deploy_no_merge", "final_evidence_required"]}
+
+
+def _build_wip_handoff_lane_payload(opportunity: dict[str, Any]) -> dict[str, Any]:
+    ref = _github_pr_ref(opportunity.get("source_url"))
+    if not ref:
+        raise ValueError("Opportunity is not a GitHub PR URL")
+    repo, pr_number = ref
+    cfg = get_visibility_config()
+    if not cfg.github_repo_allowed(repo):
+        raise ValueError(f"Visibility OS is restricted to configured GitHub repositories: {cfg.github_scope_label}")
+    metadata = opportunity.get("metadata") or {}
+    prompt = "\n".join([
+        f"You are running the Visibility OS automated WIP handoff lane for {cfg.company_name}.",
+        "Goal: conservatively prepare a local handoff/continuation branch for a stale WIP PR. Do not push or update the PR yet.",
+        f"Repository: {repo}",
+        f"PR: #{pr_number} {opportunity.get('source_url')}",
+        f"PR title: {metadata.get('title') or opportunity.get('title') or ''}",
+        "Rules: re-check the PR is still open, avoid speculative product changes, make the smallest safe continuation or documentation/handoff change, self-audit, and return JSON with branch, commit_sha, commit_message, pr_title, pr_body, verification, changed_files, self_audit, ready_to_push.",
+        "Do not push, merge, deploy, rotate secrets, or touch production infrastructure.",
+    ])
+    return {"lane": "prepare_handoff_branch", "repo": repo, "pr_number": pr_number, "pr_url": opportunity.get("source_url"), "pr_context": {"number": pr_number, "base_branch": metadata.get("baseRefName") or "main"}, "prompt": prompt, "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-wip-handoff", "--toolsets", "terminal,file"], "safety_gates": ["pr_open_recheck", "configured_org_only", "local_verification_before_push", "self_audit_before_push", "independent_review_before_push", "no_push_until_human_approves"]}
+
+
+def _build_pr_review_lane_payload(opportunity: dict[str, Any]) -> dict[str, Any]:
+    ref = _github_pr_ref(opportunity.get("source_url"))
+    if not ref:
+        raise ValueError("Opportunity is not a GitHub PR URL")
+    repo, pr_number = ref
+    cfg = get_visibility_config()
+    if not cfg.github_repo_allowed(repo):
+        raise ValueError(f"Visibility OS is restricted to configured GitHub repositories: {cfg.github_scope_label}")
+    metadata = opportunity.get("metadata") or {}
+    prompt = "\n".join([
+        f"You are a fresh unbiased PR reviewer for {cfg.company_name}.",
+        "Review only the PR diff, linked issue/context available from GitHub, changed files, and CI evidence. Do not use previous chat/session context.",
+        f"Repository: {repo}",
+        f"PR: #{pr_number}",
+        f"PR URL: {opportunity.get('source_url')}",
+        f"PR title: {metadata.get('title') or opportunity.get('title') or ''}",
+        "Do not push, merge, deploy, or edit code. Return a proposed review comment only.",
+        "Return JSON only with: review_status, body, findings, notes. review_status should be one of approve, comment_only, request_changes, needs_human_review.",
+    ])
+    return {"lane": "review_pr", "repo": repo, "pr_number": pr_number, "pr_url": opportunity.get("source_url"), "prompt": prompt, "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-pr-review", "--toolsets", "terminal,file"], "safety_gates": ["fresh_session_review", "no_code_changes", "post_review_requires_human_approval"]}
 
 
 def _important_log_lines(log: str) -> list[str]:
@@ -464,7 +602,7 @@ def draft_action_from_opportunity(opportunity_id: str, *, action_kind: str, targ
             action_type="github_issue_fix_lane",
             target_system="hermes",
             target_location=target_location or f"{payload.get('repo')}#{payload.get('issue_number')}",
-            title=f"Fix GitHub issue #{payload.get('issue_number')}: {opportunity.get('title', '')[:80]}",
+            title=f"{_issue_lane_for_category(opportunity.get('category') or '')[1]} #{payload.get('issue_number')}: {opportunity.get('title', '')[:80]}",
             summary=f"Approval-gated Hermes issue fix lane for opportunity {opportunity_id}.",
             proposed_payload=payload,
             evidence_links=evidence_links,
@@ -474,6 +612,60 @@ def draft_action_from_opportunity(opportunity_id: str, *, action_kind: str, targ
             visibility_score=opportunity.get("visibility_score"),
             effort_score=opportunity.get("effort_score"),
             approval_reason="Automated issue repair may create local branches and commits, so it requires human approval before execution. Pushing is queued as a separate explicit action.",
+        )
+    if action_kind == "pr_ci_fix_lane":
+        payload = _build_pr_ci_fix_lane_payload(opportunity)
+        return create_action(
+            proposed_by_agent=actor,
+            action_type="pr_ci_fix_lane",
+            target_system="hermes",
+            target_location=target_location or f"{payload.get('repo')}#{payload.get('pr_number')}",
+            title=f"Fix PR CI #{payload.get('pr_number')}: {opportunity.get('title', '')[:80]}",
+            summary=f"Approval-gated Hermes PR CI fix lane for opportunity {opportunity_id}.",
+            proposed_payload=payload,
+            evidence_links=evidence_links,
+            risk_level="high",
+            opportunity_id=opportunity_id,
+            impact_score=opportunity.get("impact_score"),
+            visibility_score=opportunity.get("visibility_score"),
+            effort_score=opportunity.get("effort_score"),
+            approval_reason="Automated PR CI repair may create local branches and commits. Pushing is queued as a separate explicit action.",
+        )
+    if action_kind == "wip_handoff_lane":
+        payload = _build_wip_handoff_lane_payload(opportunity)
+        return create_action(
+            proposed_by_agent=actor,
+            action_type="wip_handoff_lane",
+            target_system="hermes",
+            target_location=target_location or f"{payload.get('repo')}#{payload.get('pr_number')}",
+            title=f"Prepare WIP handoff #{payload.get('pr_number')}: {opportunity.get('title', '')[:80]}",
+            summary=f"Approval-gated Hermes WIP handoff lane for opportunity {opportunity_id}.",
+            proposed_payload=payload,
+            evidence_links=evidence_links,
+            risk_level="high",
+            opportunity_id=opportunity_id,
+            impact_score=opportunity.get("impact_score"),
+            visibility_score=opportunity.get("visibility_score"),
+            effort_score=opportunity.get("effort_score"),
+            approval_reason="Automated WIP handoff may create local branches and commits. Pushing is queued as a separate explicit action.",
+        )
+    if action_kind == "github_pr_review_lane":
+        payload = _build_pr_review_lane_payload(opportunity)
+        return create_action(
+            proposed_by_agent=actor,
+            action_type="github_pr_review_lane",
+            target_system="hermes",
+            target_location=target_location or f"{payload.get('repo')}#{payload.get('pr_number')}",
+            title=f"Review PR #{payload.get('pr_number')}: {opportunity.get('title', '')[:80]}",
+            summary=f"Fresh-session Hermes PR review for opportunity {opportunity_id}.",
+            proposed_payload=payload,
+            evidence_links=evidence_links,
+            risk_level="medium",
+            opportunity_id=opportunity_id,
+            impact_score=opportunity.get("impact_score"),
+            visibility_score=opportunity.get("visibility_score"),
+            effort_score=opportunity.get("effort_score"),
+            approval_reason="Queues an external GitHub review/comment only after human approval.",
         )
     if action_kind == "github_pr_comment":
         action_type = "github_pr_comment"
@@ -523,5 +715,8 @@ def _recommended_label(action_kind: str) -> str:
         "github_issue_fix_lane": "Fix issue",
         "github_pr_comment": "Draft PR coordination comment",
         "github_issue_comment": "Draft issue coordination comment",
+        "pr_ci_fix_lane": "Fix PR CI",
+        "wip_handoff_lane": "Prepare Handoff Branch",
+        "github_pr_review_lane": "Review PR",
         "slack_update": "Draft Slack update",
     }.get(action_kind, "Draft action")
