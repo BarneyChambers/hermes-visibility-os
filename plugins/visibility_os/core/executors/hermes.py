@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -32,17 +31,34 @@ def _command_with_prompt(command: list[Any], prompt: str, *, source: str = "visi
     return [prompt if str(part) == "__PROMPT__" else str(part) for part in command]
 
 
+def _extract_json_object(text: str, *, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            candidates.append((idx + end, parsed))
+    if not candidates:
+        raise RuntimeError(f"{label} must return JSON")
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
 def _parse_prepared_fix(stdout: str) -> dict[str, Any]:
     text = (stdout or "").strip()
     if not text:
         raise RuntimeError("Hermes Fix CI lane returned no prepared-branch payload")
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            raise RuntimeError("Hermes Fix CI lane must return JSON describing the prepared branch")
-        parsed = json.loads(match.group(0))
+    parsed = _extract_json_object(text, label="Hermes Fix CI lane")
     if not isinstance(parsed, dict):
         raise RuntimeError("Hermes Fix CI lane JSON must be an object")
     missing = [key for key in ("branch", "commit_message", "pr_title", "pr_body", "self_audit") if not parsed.get(key)]
@@ -60,13 +76,7 @@ def _parse_json_object(stdout: str, *, label: str) -> dict[str, Any]:
     text = (stdout or "").strip()
     if not text:
         raise RuntimeError(f"{label} returned no JSON payload")
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            raise RuntimeError(f"{label} must return JSON")
-        parsed = json.loads(match.group(0))
+    parsed = _extract_json_object(text, label=label)
     if not isinstance(parsed, dict):
         raise RuntimeError(f"{label} JSON must be an object")
     return parsed

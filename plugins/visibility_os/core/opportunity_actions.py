@@ -515,6 +515,8 @@ def _build_wip_handoff_lane_payload(opportunity: dict[str, Any]) -> dict[str, An
         f"PR: #{pr_number} {opportunity.get('source_url')}",
         f"PR title: {metadata.get('title') or opportunity.get('title') or ''}",
         "Rules: re-check the PR is still open, avoid speculative product changes, make the smallest safe continuation or documentation/handoff change, self-audit, and return JSON with branch, commit_sha, commit_message, pr_title, pr_body, verification, changed_files, self_audit, ready_to_push.",
+        "self_audit must be an object with: audit_status, issues_found, fixes_applied, notes.",
+        "ready_to_push must be true only when the local branch is committed, verified, self-audited, and ready for a separate human-approved push action.",
         "Do not push, merge, deploy, rotate secrets, or touch production infrastructure.",
     ])
     return {"lane": "prepare_handoff_branch", "repo": repo, "pr_number": pr_number, "pr_url": opportunity.get("source_url"), "pr_context": {"number": pr_number, "base_branch": metadata.get("baseRefName") or "main"}, "prompt": prompt, "command": ["hermes", "chat", "--query", "__PROMPT__", "--quiet", "--source", "visibility-os-wip-handoff", "--toolsets", "terminal,file"], "safety_gates": ["pr_open_recheck", "configured_org_only", "local_verification_before_push", "self_audit_before_push", "independent_review_before_push", "no_push_until_human_approves"]}

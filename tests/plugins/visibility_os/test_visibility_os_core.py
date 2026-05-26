@@ -1423,6 +1423,49 @@ def test_issue_categories_get_specific_fix_lane_labels(tmp_path, monkeypatch):
         assert action["proposed_payload"]["lane"] == issue_lane
 
 
+def test_prepared_fix_parser_uses_last_valid_json_object():
+    from plugins.visibility_os.core.executors.hermes import _parse_prepared_fix
+
+    stdout = """
+    tool output with a Python-ish dict that is not JSON: {'not': 'json'}
+    another log line
+    {"branch":"fix/demo","commit_message":"fix: demo","pr_title":"Fix demo","pr_body":"Body","self_audit":{"audit_status":"passed","issues_found":[],"fixes_applied":[],"notes":"ok"},"ready_to_push":true}
+    """
+
+    parsed = _parse_prepared_fix(stdout)
+    assert parsed["branch"] == "fix/demo"
+    assert parsed["self_audit"]["audit_status"] == "passed"
+
+
+def test_wip_handoff_prompt_requires_structured_self_audit(tmp_path, monkeypatch):
+    patch_db(tmp_path, monkeypatch)
+    from plugins.visibility_os.core.opportunities import upsert_opportunity
+    from plugins.visibility_os.core.opportunity_actions import draft_action_from_opportunity
+
+    monkeypatch.setenv("VISIBILITY_OS_GITHUB_ORGS", "acme-inc")
+    monkeypatch.setenv("VISIBILITY_OS_GITHUB_REPOS", "acme-inc/web-app")
+    opportunity = upsert_opportunity(
+        source_system="github",
+        source_url="https://github.com/acme-inc/web-app/pull/77",
+        title="WIP payment handoff",
+        description="Opportunity for stale_wip_handoff",
+        category="stale_wip_handoff",
+        impact_score=4,
+        visibility_score=4,
+        effort_score=4,
+        safety_score=5,
+        risk_penalty=0,
+        priority_score=29,
+        suggested_artifacts=["pull_request"],
+        metadata={"number": 77, "title": "WIP payment handoff", "body": "Please continue conservatively.", "url": "https://github.com/acme-inc/web-app/pull/77"},
+    )
+
+    action = draft_action_from_opportunity(opportunity["id"], action_kind="wip_handoff_lane", actor="human")
+    prompt = action["proposed_payload"]["prompt"]
+    assert "self_audit must be an object with: audit_status" in prompt
+    assert "ready_to_push must be true only" in prompt
+
+
 def test_pr_review_lane_runs_fresh_agent_and_queues_post_review(tmp_path, monkeypatch):
     patch_db(tmp_path, monkeypatch)
     from plugins.visibility_os.core.actions import create_action, approve_action, list_actions
