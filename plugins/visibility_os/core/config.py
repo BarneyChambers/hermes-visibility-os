@@ -7,9 +7,6 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
-_ENV_CACHE: dict[str, str] | None = None
-
-
 def _parse_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -27,10 +24,8 @@ def env_value(name: str, default: str = "") -> str:
     value = os.getenv(name)
     if value is not None:
         return value
-    global _ENV_CACHE
-    if _ENV_CACHE is None:
-        _ENV_CACHE = _parse_env_file(Path(get_hermes_home()) / ".env")
-    return _ENV_CACHE.get(name, default)
+    values = _parse_env_file(Path(get_hermes_home()) / ".env")
+    return values.get(name, default)
 
 
 def _csv(value: str) -> list[str]:
