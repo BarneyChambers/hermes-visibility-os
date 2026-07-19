@@ -2,6 +2,18 @@
 
 Visibility OS is a Hermes dashboard plugin for engineering-lead visibility. It scans configured GitHub repositories for actionable issues, PRs, and failing CI, then drafts Slack or GitHub updates behind a human approval queue.
 
+## Companion X/Twitter Visibility
+
+For public launch, support, or incident profiles, pair Visibility OS with
+[Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet). Hermes Tweet can
+collect X/Twitter account, post, or trend context inside Hermes, while
+Visibility OS can turn that context into reviewed Slack or GitHub update drafts
+behind the existing approval queue. Hermes Tweet is a third-party project
+maintained by Xquik-dev, not by this repository.
+
+Xquik is an independent third-party service. Not affiliated with X Corp.
+"Twitter" and "X" are trademarks of X Corp.
+
 ## Features
 
 - GitHub repository scanning for issues, pull requests, and CI failures
